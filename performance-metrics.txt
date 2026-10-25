@@ -1,0 +1,244 @@
+# ==============================================================================
+# LEDGERPAY BACKEND PERFORMANCE MEASUREMENT REPORT & BENCHMARKING PLAN
+# ==============================================================================
+# Document Path : /performance-metrics.txt
+# Repository    : LedgerPay (Portfolio Fintech Wallet & Payment Ledger Engine)
+# Author        : Portfolio Engineering / Backend Performance Audit
+# Target Spec   : High-Integrity Double-Entry Payment Systems (e.g., Visa / FinTech)
+# ==============================================================================
+
+--------------------------------------------------------------------------------
+1. PROJECT AND ENVIRONMENT DETAILS
+--------------------------------------------------------------------------------
+Architecture Overview:
+  - Application       : LedgerPay Backend (Spring Boot 3.3.5, Java 17 bytecode target, executed on Java 21)
+  - Persistence Layer : Spring Data JPA, Hibernate ORM 6.5.3, Flyway Core 10.10.0
+  - Security Model    : Stateless Spring Security with JJWT 0.12.6 (HMAC-SHA256)
+  - Concurrency Lock  : Pessimistic write locking (PESSIMISTIC_WRITE / SELECT ... FOR UPDATE)
+                        Deterministic ascending wallet ID order (min(id), max(id)) to eliminate deadlocks.
+  - Accounting Engine : Strict double-entry ledger (debit == credit assertion before commit).
+  - Idempotency       : Client-provided Idempotency-Key header mapped to a partial unique database index:
+                        idx_transfers_idempotency ON transfers(sender_wallet_id, idempotency_key).
+  - Primary Database  : PostgreSQL 16 (via Docker / local postmaster on port 5432)
+  - Fallback / Dev DB : In-memory H2 database in PostgreSQL compatibility mode (-Dspring-boot.run.profiles=local)
+  - Connection Pool   : HikariCP (Default configuration: maximumPoolSize=10, connectionTimeout=30000ms)
+
+Hardware & Runtime Environment (Reference Benchmark Rig):
+  - Operating System  : Windows 11 (build 10.0, amd64)
+  - Runtime Host      : Local Developer Machine
+  - JVM Configuration : Java HotSpot(TM) 64-Bit Server VM (build 21.0.12.1 / OpenJDK)
+  - Default Threading : Embedded Apache Tomcat 10.1.31 (maxThreads=200 default worker threads)
+
+--------------------------------------------------------------------------------
+2. TOOLS SELECTED AND THEIR PURPOSE
+--------------------------------------------------------------------------------
+To establish a disciplined, reproducible benchmark pipeline without bloat, three
+complementary tools are utilized:
+
+A. Apache JMeter (or Lightweight CLI alternative k6 / Newman)
+   - Purpose  : HTTP API load, stress, and concurrency generation.
+   - Utility  : Generates parameterized concurrent user threads simulating wallet transfers,
+                login storms, and idempotent retries; captures latencies (p50, p95, p99),
+                throughput (requests/second), and HTTP status distributions (200, 201, 400, 409, 429).
+   - Artifact : Included in repository at `/performance/jmeter-test-plan.jmx` and PowerShell runner.
+
+B. Spring Boot Actuator & Micrometer
+   - Purpose  : In-flight JVM and application performance telemetry.
+   - Utility  : Already integrated via `spring-boot-starter-actuator` in pom.xml. Exposes
+                critical metrics at `/actuator/metrics` including:
+                  * `hikaricp.connections.active`, `hikaricp.connections.pending`, `hikaricp.connections.acquire`
+                  * `jvm.memory.used`, `jvm.gc.pause`, `jvm.threads.live`
+                  * `http.server.requests` (response times segmented by URI and status)
+                Securely exposed (sensitive health/environment details restricted).
+
+C. PostgreSQL Statistics (`pg_stat_statements` & `pg_stat_activity`)
+   - Purpose  : Relational engine latency and transaction contention auditing.
+   - Utility  : Exposes row-lock wait times (`pg_locks`), transaction commit vs rollback ratios
+                (`pg_stat_database`), and execution latency of `SELECT ... FOR UPDATE` row locks.
+
+--------------------------------------------------------------------------------
+3. APIS TO BENCHMARK
+--------------------------------------------------------------------------------
+The benchmark covers 5 core endpoints representing both high-volume read traffic
+and write-heavy, lock-contended transactional workflows:
+
+1. POST /api/auth/login
+   - Profile    : Compute/CPU-bound (BCrypt hashing work factor 10).
+   - Payload    : {"email": "aarav@ledgerpay.in", "password": "demo1234"}
+   - Goal       : Baseline authentication overhead and rate limiter threshold.
+
+2. GET /api/wallet
+   - Profile    : Read-only, indexed single-record retrieval.
+   - Headers    : Authorization: Bearer <JWT>
+   - Goal       : Evaluates HikariCP connection acquire latency and caching potential.
+
+3. GET /api/wallet/transactions?page=0&size=20
+   - Profile    : Read-only, filtered multi-table join and sorting query.
+   - Headers    : Authorization: Bearer <JWT>
+   - Goal       : Evaluates index scanning on transfers table under pagination.
+
+4. POST /api/transfers
+   - Profile    : Write-heavy, multi-entity atomic transaction with pessimistic locking.
+   - Headers    : Authorization: Bearer <JWT>, Idempotency-Key: <UUID>
+   - Payload    : {"recipientEmail": "priya@ledgerpay.in", "amount": 250.00, "description": "Benchmark transfer"}
+   - Criticality: CRITICAL. Moves money, mutates balances, and inserts 2 ledger rows.
+
+5. GET /api/ledger/entries?page=0&size=20
+   - Profile    : Read-only, audit-trail ledger inspection.
+   - Headers    : Authorization: Bearer <JWT>
+   - Goal       : Measures append-only ledger query scaling as historical entries grow.
+
+--------------------------------------------------------------------------------
+4. METRICS AND DEFINITIONS
+--------------------------------------------------------------------------------
+A. API Performance:
+   - Average Latency : Mean round-trip duration from socket write to response completion.
+   - Median (p50)    : 50th percentile response time; typical user perception.
+   - p95 Latency     : 95% of requests completed faster than this threshold; reflects tail latency.
+   - p99 Latency     : 99th percentile; captures lock queuing, connection pool wait, or GC pauses.
+   - Throughput (RPS): Total successful HTTP transactions completed per second.
+   - Error Rate (%)  : Ratio of 5xx or unhandled exceptions to total requests. (Note: Handled
+                       validation errors like 400 Insufficient Funds or 409 Conflict are tracked separately).
+
+B. Database Performance:
+   - Pool Saturation : Ratio of active connections (`hikaricp.connections.active`) to pool size (10).
+   - Acquire Time    : Time waiting to check out a connection from HikariCP (`hikaricp.connections.acquire`).
+   - Lock Contention : Time spent blocked on `SELECT ... FOR UPDATE` waiting for concurrent transfers to commit.
+   - Rollback Rate   : Unplanned transaction rollbacks vs intentional domain rollbacks.
+
+C. Payment Correctness Under Load (Highest Priority):
+   - Balance Parity  : Verification that `wallet.balance` == sum(CREDIT entries) - sum(DEBIT entries).
+   - Double-Entry Sum: Mathematical proof that for all transfer batches: sum(Debits) == sum(Credits).
+   - Overdraft Guard : Zero occurrences of negative balances under simultaneous burst requests.
+   - Idempotency     : Duplicate requests with identical keys must produce exactly 0 additional ledger entries.
+
+D. Resource Utilization:
+   - JVM Heap        : Used vs committed memory (heap exhaustion / OOM risks).
+   - GC Pause Time   : Time spent in Stop-The-World (STW) garbage collection pauses.
+   - Host CPU / Mem  : Overall hardware strain during sustained concurrency.
+
+--------------------------------------------------------------------------------
+5. BASELINE & STRESS TESTING PROCEDURE
+--------------------------------------------------------------------------------
+Phase 1: Baseline Read Verification
+  - Concurrency: 1 to 5 virtual users.
+  - Duration   : 60 seconds warm-up, 120 seconds measurement.
+  - Endpoints  : GET /api/wallet, GET /api/wallet/transactions.
+  - Objective  : Isolate pure network and framework overhead without database lock contention.
+
+Phase 2: Independent Non-Contending Transfers
+  - Setup      : Multiple user pairs transferring to distinct counterparties (User A -> User B, User C -> User D).
+  - Concurrency: 10 concurrent threads.
+  - Objective  : Measure peak transactional throughput when locks do not overlap.
+
+Phase 3: High-Contention Hot-Wallet Stress Test
+  - Setup      : 20 concurrent threads attempting to spend from the SAME wallet simultaneously (Aarav Sharma).
+  - Objective  : Verify that deterministic lock ordering (`min(id), max(id)`) strictly prevents deadlocks
+                 and serializes balance updates without negative balances or phantom reads.
+
+Phase 4: Idempotent Replay Storm
+  - Setup      : 50 threads firing with the EXACT SAME (sender_wallet_id, idempotency_key).
+  - Objective  : Ensure exactly 1 transfer record and 2 ledger records exist in DB; remaining 49
+                 receive cached receipts with 0 balance discrepancies.
+
+Phase 5: Sustained Endurance & Volume Run
+  - Duration   : 10 to 15 minutes continuous mixed workload (80% reads, 20% transfers).
+  - Objective  : Detect connection leaks in HikariCP, heap memory degradation, and uncollected JVM objects.
+
+--------------------------------------------------------------------------------
+6. PROPOSED PERFORMANCE TARGETS (PROVISIONAL DEVELOPMENT GOALS)
+--------------------------------------------------------------------------------
+DISCLAIMER: The targets below are provisional engineering objectives for a local developer
+workstation. They are NOT measured benchmark guarantees. Actual throughput and latency are
+heavily governed by host hardware, disk I/O, JVM flags, and connection pool sizing.
+
+Target Goals (Local Single-Node Instance):
+  - Read APIs (GET /api/wallet)          : p95 < 25 ms,  Throughput > 200 RPS
+  - Auth API (POST /api/auth/login)      : p95 < 150 ms, Throughput > 25 RPS (CPU bound by BCrypt work factor 10)
+  - Transfer API (Non-contended)         : p95 < 60 ms,  Throughput > 50 RPS
+  - Transfer API (Hot-wallet contention) : p95 < 250 ms, 0 Deadlocks, 0 Overdrafts
+  - Error Rate (5xx Server Exceptions)   : 0.00%
+  - Payment Correctness Violations       : 0 (Strict Zero Tolerance)
+
+--------------------------------------------------------------------------------
+7. KNOWN BOTTLENECKS AND CONCURRENCY RISKS
+--------------------------------------------------------------------------------
+1. In-Memory Rate Limiting:
+   - Current implementation (`RateLimiterService`) uses a ConcurrentHashMap with synchronized
+     deque cleanup. Under high thread count, synchronized deque locking introduces minor contention.
+2. BCrypt Work Factor:
+   - Login operations intentionally consume ~80ms of CPU compute time per verification. High-rate
+     login benchmarking will saturate CPU before I/O limits are reached.
+3. Row-Level Pessimistic Locking:
+   - While ascending lock order (`min(id), max(id)`) guarantees freedom from cyclic deadlocks,
+     concurrent transfers targeting the same wallet must execute serially. Latency will scale
+     linearly with concurrency on hot accounts.
+4. Hikari Connection Pool Size:
+   - Default pool size is 10 connections. Concurrency above 10 simultaneous database-active threads
+     will queue in Hikari's checkout queue until connectionTimeout (30s) expires.
+
+--------------------------------------------------------------------------------
+8. COMMANDS AND STEPS TO EXECUTE THE TESTS
+--------------------------------------------------------------------------------
+Step 1: Start Backend in Performance Audit Mode
+  Option A (PostgreSQL Profile):
+    docker compose up -d
+    mvn spring-boot:run -f backend/pom.xml
+
+  Option B (In-Memory Local Profile):
+    mvn spring-boot:run "-Dspring-boot.run.profiles=local" -f backend/pom.xml
+
+Step 2: Inspect Initial Actuator Telemetry
+  curl http://localhost:8080/actuator/health
+  curl http://localhost:8080/actuator/metrics/hikaricp.connections.active
+  curl http://localhost:8080/actuator/metrics/jvm.memory.used
+
+Step 3: Run Automated Concurrency Benchmark Runner
+  Powershell Script provided in:
+    powershell -ExecutionPolicy Bypass -File ./performance/benchmark-runner.ps1
+
+Step 4: Run Post-Test Accounting Audit Verification
+  Query DB or execute automated balance verification query:
+  "SELECT (SELECT COALESCE(SUM(amount),0) FROM ledger_entries WHERE entry_type='DEBIT') AS total_debits,
+          (SELECT COALESCE(SUM(amount),0) FROM ledger_entries WHERE entry_type='CREDIT') AS total_credits;"
+
+--------------------------------------------------------------------------------
+9. ACTUAL MEASUREMENTS RESULTS TABLE (RUN ARCHIVE)
+--------------------------------------------------------------------------------
+Notice: Status is explicitly marked NOT MEASURED until empirical execution is logged.
+No benchmark figures are fabricated.
+
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| Test Scenario            | Users | Request | Actual | p50    | p95    | p99    | Error   | CPU / Heap       | Ledger Integrity|
+|                          | (VUs) | Count   | RPS    | Latency| Latency| Latency| Rate    | Observations     | Verification    |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 1. Read: GET /api/wallet | 5     | 500     | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | PASS (No writes)|
+|                          |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  |                  |                 |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 2. Auth: POST /login     | 5     | 100     | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | PASS (No writes)|
+|                          |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  | (CPU intensive)  |                 |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 3. Uncontended Transfers | 10    | 200     | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | NOT MEASURED    |
+| (Different Wallets)      |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  |                  |                 |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 4. Contended Hot-Wallet  | 20    | 100     | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | NOT MEASURED    |
+| (Same Sender Wallet)     |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  | (Queue serialize)|                 |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 5. Idempotent Storm      | 30    | 90      | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | NOT MEASURED    |
+| (Identical Key Replay)   |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  |                  | (1 row created) |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+| 6. Endurance Mixed Run   | 10    | 2000    | NOT    | NOT    | NOT    | NOT    | NOT     | NOT MEASURED     | NOT MEASURED    |
+| (10 min sustained)       |       |         | MEAS'D | MEAS'D | MEAS'D | MEAS'D | MEAS'D  |                  |                 |
++--------------------------+-------+---------+--------+--------+--------+--------+---------+------------------+-----------------+
+
+--------------------------------------------------------------------------------
+10. TEST CONFIGURATION & AUDIT SIGN-OFF
+--------------------------------------------------------------------------------
+Audit Protocol Status : SPECIFIED & SCRIPTED (Awaiting Live Benchmark Run)
+Integrity Invariants  :
+  1. sum(DEBIT) == sum(CREDIT) for all transfers
+  2. For all wallets: current_balance == initial_balance + credits - debits
+  3. No negative balance allowed under any concurrent load condition
+Report Completed By   : Portfolio Backend Systems Engineer
+Timestamp             : 2026-10-24T17:55:00+05:30
+# ==============================================================================
